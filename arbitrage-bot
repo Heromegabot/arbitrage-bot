@@ -1,0 +1,128 @@
+import os
+import logging
+import requests
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+
+# Читаем токен и чат ID из переменных окружения
+BOT_TOKEN = os.getenv("7814833092:AAFmD3u9hdMPLUsl3JLYLcnYZfbOMjSUz38")
+CHAT_ID = int(os.getenv("6998420486"))  # Твой Telegram ID (число)
+
+if not BOT_TOKEN or not CHAT_ID:
+    raise Exception("Пожалуйста, установите переменные окружения BOT_TOKEN и CHAT_ID")
+
+logging.basicConfig(level=logging.INFO)
+
+# Порог в процентах для уведомления
+ARBITRAGE_THRESHOLD = 0.5
+
+def get_binance_price():
+    url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+    try:
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        return float(data['price'])
+    except Exception as e:
+        logging.error(f"Binance API error: {e}")
+        return None
+
+def get_coinbase_price():
+    url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+    try:
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        return float(data['data']['amount'])
+    except Exception as e:
+        logging.error(f"Coinbase API error: {e}")
+        return None
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я арбитражный бот.\n"
+        "Я отслеживаю цены BTC на Binance и Coinbase.\n"
+        "При большой разнице буду отправлять уведомления.\n"
+        "Команда /check — проверить цены сейчас.\n"
+        f"Команда /setthreshold [число] — установить порог уведомления (текущий {ARBITRAGE_THRESHOLD}%)."
+    )
+
+async def check_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    binance_price = get_binance_price()
+    coinbase_price = get_coinbase_price()
+
+    if binance_price is None or coinbase_price is None:
+        await update.message.reply_text("Ошибка при получении цен с бирж.")
+        return
+
+    diff = abs(binance_price - coinbase_price)
+    diff_percent = (diff / min(binance_price, coinbase_price)) * 100
+
+    msg = (
+        f"Цена BTC:\n"
+        f"Binance: ${binance_price:.2f}\n"
+        f"Coinbase: ${coinbase_price:.2f}\n"
+        f"Разница: {diff_percent:.2f}%\n"
+    )
+
+    if diff_percent >= ARBITRAGE_THRESHOLD:
+        msg += "⚠ Внимание! Возможен арбитраж! Разница превышает порог."
+    else:
+        msg += "Разница меньше порога, арбитража нет."
+
+    await update.message.reply_text(msg)
+
+async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ARBITRAGE_THRESHOLD
+    try:
+        new_value = float(context.args[0])
+        if new_value <= 0:
+            raise ValueError
+        ARBITRAGE_THRESHOLD = new_value
+        await update.message.reply_text(f"Порог арбитража установлен на {ARBITRAGE_THRESHOLD:.2f}%")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Использование: /setthreshold [число больше 0]")
+
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Неизвестная команда. Используйте /start для помощи.")
+
+async def notify_arbitrage(app):
+    global ARBITRAGE_THRESHOLD
+    import asyncio
+    last_notified = False
+
+    while True:
+        binance_price = get_binance_price()
+        coinbase_price = get_coinbase_price()
+        if binance_price and coinbase_price:
+            diff = abs(binance_price - coinbase_price)
+            diff_percent = (diff / min(binance_price, coinbase_price)) * 100
+            if diff_percent >= ARBITRAGE_THRESHOLD:
+                if not last_notified:  # чтобы не спамить
+                    msg = (
+                        f"⚠ Арбитраж возможен! Разница: {diff_percent:.2f}%\n"
+                        f"Binance: ${binance_price:.2f}\n"
+                        f"Coinbase: ${coinbase_price:.2f}\n"
+                        "Проверь рынок!"
+                    )
+                    try:
+                        await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+                    except Exception as e:
+                        logging.error(f"Ошибка отправки сообщения: {e}")
+                    last_notified = True
+            else:
+                last_notified = False
+        await asyncio.sleep(5)  # проверять каждые 5 секунд
+
+if _name_ == "_main_":
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("check", check_prices))
+    app.add_handler(CommandHandler("setthreshold", set_threshold))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+
+    print("Бот запущен!")
+
+    import asyncio
+    asyncio.create_task(notify_arbitrage(app))
+
+    app.run_polling()
